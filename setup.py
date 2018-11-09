@@ -5,7 +5,7 @@ with open('README.md', 'r') as fh:
 
 setuptools.setup(
     name='sharepoint',
-    version='0.0.1',
+    version='0.0.2',
     author='James Classen',
     author_email='jclassen@ĝᶆӓīł.ᴄṓᴟ', #fix unicode stuff to email
     description='A Python-based SharePoint interface',

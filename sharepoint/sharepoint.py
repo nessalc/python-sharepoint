@@ -4,6 +4,7 @@ import requests
 import urllib.parse
 from pathlib import PurePosixPath as P
 from pathlib import Path
+import dateutil.parser
 
 HOMEPAGE='SitePages/Home.aspx'
 
@@ -40,7 +41,7 @@ class SharePointSite:
             self.headers={'Accept':'application/json;odata=verbose'}
         else:
             self.headers={}
-    def _fetch(self,url,return_format):
+    def __fetch(self,url,return_format):
         if return_format!=self.return_format and return_format=='json':
             headers={'Accept':'application/json;odata=verbose'}
         else:
@@ -63,14 +64,14 @@ class SharePointSite:
     def get_all_lists(self):
         url=urllib.parse.urljoin(self.api_url,
                                  'lists')
-        return self._fetch(url,self.return_format)
+        return self.__fetch(url,self.return_format)
     def get_list(self,list_name):
         url=urllib.parse.urljoin(self.api_url,
                                  "lists/GetByTitle('{}')/items".format(list_name))
-        return self._fetch(url,self.return_format)
+        return self.__fetch(url,self.return_format)
     def get_base_folders(self):
         url=urllib.parse.urljoin(self.api_url,'folders')
-        return self._fetch(url,self.return_format)
+        return self.__fetch(url,self.return_format)
     def get_folder_list(self,folder_name,expand=0,prepend_base_path=True):
         return self.get_folder_property(folder_name,'Folders',prepend_base_path)
     def get_folder_property(self,folder_name,property_name,prepend_base_path=True):
@@ -78,7 +79,7 @@ class SharePointSite:
             folder_name=urllib.parse.urljoin(self.base_path,folder_name)
         url=urllib.parse.urljoin(self.api_url,
                                  "GetFolderByServerRelativeUrl('{}')/{}".format(folder_name,property_name))
-        return self._fetch(url,self.return_format)[property_name]
+        return self.__fetch(url,self.return_format)[property_name]
     def get_file_list(self,folder_name,prepend_base_path=True):
         return self.get_folder_property(folder_name,'Files',prepend_base_path)
     def get_file_info(self,file_name,prepend_base_path=True):
@@ -86,7 +87,7 @@ class SharePointSite:
             file_name=urllib.parse.urljoin(self.base_path,file_name)
         url=urllib.parse.urljoin(self.api_url,
                                  "GetFileByServerRelativeUrl('{}')".format(file_name))
-        return self._fetch(url,self.return_format)
+        return self.__fetch(url,self.return_format)
     def get_file_id(self,file_path,prepend_base_path=True):
         fdict=self.get_file_property(file_path,'ListItemAllFields',prepend_base_path)
         return fdict['Id']
@@ -95,15 +96,14 @@ class SharePointSite:
             file_name=urllib.parse.urljoin(self.base_path,file_name)
         url=urllib.parse.urljoin(self.api_url,
                                  "GetFileByServerRelativeUrl('{}')/{}".format(file_name,property_name))
-        r=self._fetch(url,self.return_format)
         try:
-            return r[property_name]
+            return self.__fetch(url,self.return_format)[property_name]
         except (TypeError,KeyError):
-            return r
+            return self.__fetch(url,self.return_format)
     def get_file(self,file_name,version=None,prepend_base_path=True):
         if version:
             url=urllib.parse.urljoin(self.site_url,self.get_file_property(file_name,'versions({})/Url'.format(version))['Url'])
-            data=self._fetch(url,self.return_format).content
+            data=self.__fetch(url,self.return_format).content
         else:
             data=self.get_file_property(file_name,'openbinarystream',prepend_base_path).content
         fname=Path(file_name)
@@ -116,6 +116,32 @@ class SharePointSite:
         file.write(data)
         file.close()
         return Path.cwd().joinpath(fname)
+    def __dictify(self,resultlist):
+        result={}
+        for i in resultlist:
+            if i['ValueType']=='Edm.Double':
+                v=float(i['Value'])
+            elif i['ValueType'] in ['Edm.String','Edm.Guid']:
+                v=i['Value']
+            elif i['ValueType'] in ['Edm.Int64','Edm.Int32']:
+                v=int(i['Value'])
+            elif i['ValueType']=='Null':
+                v=None
+            elif i['ValueType']=='Edm.DateTime':
+                v=dateutil.parser.parse(i['Value'])
+            elif i['ValueType']=='Edm.Boolean':
+                v=(i['Value']=='true')
+            result[i['Key']]=v
+        return result
+    def __get_deferred_properties(self,resultdict):
+        if self.return_format=='json':
+            for k,v in resultdict.items():
+                if isinstance(v,dict) and '__deferred' in v.keys():
+                    try:
+                        resultdict[k]=self.__fetch(v['__deferred']['uri'],self.return_format)
+                    except requests.exceptions.HTTPError:
+                        pass
+        return None
     def get_relative_path_from_link(self,link):
         if link.find(self.site_url)==0:
             parsed=urllib.parse.urlsplit(link)
@@ -137,8 +163,35 @@ class SharePointSite:
         for k,v in kwargs.items():
             kwargs[k]="'{}'".format(v)
         kwargs.update({'querytext':"'{}'".format(querytext)})
-        return requests.get(urllib.parse.urljoin(self.site_url,'_api/search/query'),
-                            kwargs,
-                            auth=self.auth,
-                            headers=self.headers)
+        r=requests.get(urllib.parse.urljoin(self.site_url,'_api/search/query'),
+                       kwargs,
+                       auth=self.auth,
+                       headers={'Accept':'application/json;odata=verbose'})
+        try:
+            r=r.json()['d']['query']['PrimaryQueryResult']['RelevantResults']
+            t=r['Table']['Rows']['results']
+            return [self.__dictify(t[k]['Cells']['results']) for k in range(len(t))]
+        except KeyError:
+            return r
+    def find_file_version(self,filename,file_id,file_version=None):
+        r=self.query('listitemid:{} and filename:"{}"'.format(file_id,filename))
+        if len(r)==1:
+            k=self.get_file_info(r[0]['Path'].replace(self.server_url,''),False)
+            if file_version is None:
+                return {'Version':k['UIVersion'],
+                        'UIVersionLabel':k['UIVersionLabel'],
+                        'URL':urllib.parse.urljoin(self.server_url,k['ServerRelativeUrl'])}
+            elif k['UIVersionLabel']==str(file_version):
+                return {'Version':k['UIVersion'],
+                        'URL':urllib.parse.urljoin(self.server_url,k['ServerRelativeUrl'])}
+            self.__get_deferred_properties(k)
+            for v in k['Versions']:
+                if v['VersionLabel']==str(file_version):
+                    return {'Version':v['ID'],
+                            'URL':urllib.parse.urljoin(self.site_url,v['Url'])}
+            return None
+        elif len(r)==0:
+            raise Exception('No results found!')
+        else:
+            raise Exception('Too many results found!')
     query=simple_query
